@@ -412,7 +412,7 @@ fn sidebar_is_visible(state: &AppState) -> bool {
     state
         .paned
         .start_child()
-        .map(|sidebar| sidebar.is_visible() && state.paned.position() > 10)
+        .map(|sidebar| sidebar.is_visible() && state.paned.position() > SIDEBAR_POSITION_THRESHOLD)
         .unwrap_or(false)
 }
 
@@ -1030,10 +1030,10 @@ pub fn build_window(app: &adw::Application) {
         });
         drag.connect_drag_end({
             let state = state.clone();
-            move |gesture, _dx, dy| {
+            move |gesture, _dx, _dy| {
                 // Treat very small movement as a click → toggle sidebar.
                 let (off_x, off_y) = gesture.offset().unwrap_or((0.0, 0.0));
-                if off_x.abs() < 8.0 && off_y.abs() < 8.0 && dy.abs() < 8.0 {
+                if off_x.abs() < 8.0 && off_y.abs() < 8.0 {
                     toggle_sidebar(&state);
                 } else {
                     request_session_save(&state);
@@ -1092,7 +1092,7 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         main_paned.connect_position_notify(move |paned| {
             let position = paned.position();
-            let should_save = if position > 10 {
+            let should_save = if position > SIDEBAR_POSITION_THRESHOLD {
                 let mut s = state.borrow_mut();
                 let changed = s.sidebar_expanded_width != position;
                 s.sidebar_expanded_width = position;
@@ -3511,6 +3511,8 @@ fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
 const SIDEBAR_WIDTH: i32 = 220;
 /// Default vertical offset for the floating sidebar toggle tab, in pixels.
 const SIDEBAR_TAB_DEFAULT_Y: i32 = 120;
+/// Paned positions at or below this threshold are treated as "sidebar collapsed".
+const SIDEBAR_POSITION_THRESHOLD: i32 = 10;
 
 fn sync_top_bar_visibility(state: &State) {
     let (top_bar, preferred_visible, fullscreened) = {
@@ -3552,7 +3554,7 @@ fn toggle_sidebar(state: &State) {
             return;
         };
         let current = s.paned.position();
-        let is_visible = current > 10; // treat < 10px as collapsed
+        let is_visible = current > SIDEBAR_POSITION_THRESHOLD; // treat as collapsed if ≤ threshold
         if is_visible {
             s.sidebar_expanded_width = current;
         }
@@ -3669,7 +3671,7 @@ fn update_sidebar_tab_icon(state: &State) {
         let visible = s
             .paned
             .start_child()
-            .map(|sidebar| sidebar.is_visible() && s.paned.position() > 10)
+            .map(|sidebar| sidebar.is_visible() && s.paned.position() > SIDEBAR_POSITION_THRESHOLD)
             .unwrap_or(false);
         (s.sidebar_tab.clone(), visible)
     };
