@@ -30,6 +30,10 @@ pub struct SidebarState {
     pub visible: bool,
     #[serde(default = "default_sidebar_width")]
     pub width: i32,
+    /// Vertical pixel offset of the floating sidebar toggle tab. `None` means
+    /// use the built-in default (roughly one-third down the content area).
+    #[serde(default)]
+    pub tab_y: Option<i32>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -130,6 +134,7 @@ impl Default for SidebarState {
         Self {
             visible: default_sidebar_visible(),
             width: default_sidebar_width(),
+            tab_y: None,
         }
     }
 }

@@ -72,6 +72,10 @@ pub(crate) struct AppState {
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
+    /// The floating sidebar toggle tab button (overlay on the content area).
+    sidebar_tab: gtk::Button,
+    /// Current vertical pixel offset of the sidebar toggle tab.
+    sidebar_tab_y: i32,
     persistence_suspended: bool,
     save_queued: bool,
     workspace_dragging: Option<String>,
@@ -326,15 +330,23 @@ fn restore_active_workspace(state: &State, index: usize) {
 }
 
 fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::SidebarState) {
-    let (paned, sidebar, width) = {
+    let (paned, sidebar, width, tab, tab_y) = {
         let mut s = state.borrow_mut();
         s.sidebar_expanded_width = sidebar_state.width.max(SIDEBAR_WIDTH);
         let sidebar = match s.paned.start_child() {
             Some(sidebar) => sidebar,
             None => return,
         };
-        (s.paned.clone(), sidebar, s.sidebar_expanded_width)
+        // Restore tab vertical position from persisted state.
+        if let Some(y) = sidebar_state.tab_y {
+            s.sidebar_tab_y = y.max(0);
+        }
+        let tab = s.sidebar_tab.clone();
+        let tab_y = s.sidebar_tab_y;
+        (s.paned.clone(), sidebar, s.sidebar_expanded_width, tab, tab_y)
     };
+
+    tab.set_margin_top(tab_y);
 
     if sidebar_state.visible {
         sidebar.set_visible(true);
@@ -345,6 +357,7 @@ fn apply_sidebar_state_immediately(state: &State, sidebar_state: &layout_state::
         sidebar.set_visible(false);
         paned.set_position(0);
     }
+    update_sidebar_tab_icon(state);
 }
 
 fn apply_top_bar_state_immediately(state: &State, visible: bool) {
@@ -389,6 +402,7 @@ fn snapshot_session_state(state: &State) -> AppSessionState {
         sidebar: layout_state::SidebarState {
             visible: sidebar_visible,
             width: sidebar_width,
+            tab_y: Some(s.sidebar_tab_y),
         },
         workspaces,
     })
@@ -703,6 +717,24 @@ row:selected .limux-ws-star-btn {
     background-color: alpha(@accent_bg_color, 0.28);
     border-color: alpha(@accent_bg_color, 0.9);
 }
+.limux-sidebar-tab {
+    background: alpha(@window_bg_color, 0.78);
+    border: 1px solid alpha(@window_fg_color, 0.10);
+    border-left: none;
+    border-radius: 0 8px 8px 0;
+    min-width: 13px;
+    min-height: 44px;
+    padding: 0 2px 0 0;
+    transition: background 130ms ease, border-color 130ms ease, min-width 130ms ease;
+    -gtk-icon-size: 11px;
+    color: alpha(@window_fg_color, 0.30);
+}
+.limux-sidebar-tab:hover {
+    background: alpha(@window_bg_color, 0.97);
+    border-color: alpha(@window_fg_color, 0.22);
+    min-width: 18px;
+    color: alpha(@window_fg_color, 0.75);
+}
 .limux-ws-path {
     color: alpha(@window_fg_color, 0.3);
     font-size: 12px;
@@ -908,6 +940,23 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&sidebar_scroll);
     sidebar.append(&new_ws_btn);
 
+    // Wrap the content stack in an overlay so we can float the sidebar toggle
+    // tab on its left edge.
+    let content_overlay = gtk::Overlay::new();
+    content_overlay.set_child(Some(&stack));
+    content_overlay.set_hexpand(true);
+    content_overlay.set_vexpand(true);
+
+    // Build the floating sidebar toggle tab.
+    let sidebar_tab = gtk::Button::new();
+    sidebar_tab.add_css_class("limux-sidebar-tab");
+    sidebar_tab.set_halign(gtk::Align::Start);
+    sidebar_tab.set_valign(gtk::Align::Start);
+    sidebar_tab.set_margin_top(SIDEBAR_TAB_DEFAULT_Y);
+    // The tab doesn't affect layout measurement.
+    content_overlay.set_measure_overlay(&sidebar_tab, false);
+    content_overlay.add_overlay(&sidebar_tab);
+
     let main_paned = gtk::Paned::builder()
         .orientation(gtk::Orientation::Horizontal)
         .position(220)
@@ -916,7 +965,7 @@ pub fn build_window(app: &adw::Application) {
         .shrink_start_child(false)
         .shrink_end_child(false)
         .start_child(&sidebar)
-        .end_child(&stack)
+        .end_child(&content_overlay)
         .build();
 
     let vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -943,6 +992,8 @@ pub fn build_window(app: &adw::Application) {
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
+        sidebar_tab: sidebar_tab.clone(),
+        sidebar_tab_y: SIDEBAR_TAB_DEFAULT_Y,
         persistence_suspended: false,
         save_queued: false,
         workspace_dragging: None,
@@ -953,6 +1004,46 @@ pub fn build_window(app: &adw::Application) {
     CONTROL_STATE.with(|slot| {
         *slot.borrow_mut() = Some(state.clone());
     });
+
+    // Wire up the floating sidebar toggle tab.
+    {
+        let state = state.clone();
+        let drag = gtk::GestureDrag::new();
+        // Record the tab's y position when the drag begins.
+        let drag_start_y: Rc<Cell<i32>> = Rc::new(Cell::new(SIDEBAR_TAB_DEFAULT_Y));
+        drag.connect_drag_begin({
+            let state = state.clone();
+            let drag_start_y = drag_start_y.clone();
+            move |_, _dx, _dy| {
+                drag_start_y.set(state.borrow().sidebar_tab_y);
+            }
+        });
+        drag.connect_drag_update({
+            let state = state.clone();
+            let drag_start_y = drag_start_y.clone();
+            move |_, _dx, dy| {
+                let new_y = (drag_start_y.get() as f64 + dy).max(0.0) as i32;
+                let tab = state.borrow().sidebar_tab.clone();
+                tab.set_margin_top(new_y);
+                state.borrow_mut().sidebar_tab_y = new_y;
+            }
+        });
+        drag.connect_drag_end({
+            let state = state.clone();
+            move |gesture, _dx, dy| {
+                // Treat very small movement as a click → toggle sidebar.
+                let (off_x, off_y) = gesture.offset().unwrap_or((0.0, 0.0));
+                if off_x.abs() < 8.0 && off_y.abs() < 8.0 && dy.abs() < 8.0 {
+                    toggle_sidebar(&state);
+                } else {
+                    request_session_save(&state);
+                }
+            }
+        });
+        sidebar_tab.add_controller(drag);
+        // Set the initial icon based on current sidebar state (open at startup).
+        update_sidebar_tab_icon(&state);
+    }
 
     {
         let state = state.clone();
@@ -3418,6 +3509,8 @@ fn first_leaf_pane(widget: &gtk::Widget) -> gtk::Widget {
 
 /// Default sidebar width in pixels.
 const SIDEBAR_WIDTH: i32 = 220;
+/// Default vertical offset for the floating sidebar toggle tab, in pixels.
+const SIDEBAR_TAB_DEFAULT_Y: i32 = 120;
 
 fn sync_top_bar_visibility(state: &State) {
     let (top_bar, preferred_visible, fullscreened) = {
@@ -3481,8 +3574,21 @@ fn toggle_sidebar(state: &State) {
         animation.pause();
     }
 
+    // Update the tab icon to show the destination state immediately, so it
+    // reflects where the sidebar is heading rather than where it started.
+    {
+        let tab = state.borrow().sidebar_tab.clone();
+        if is_visible {
+            // Collapsing → after done the sidebar will be hidden, so invite expansion.
+            tab.set_icon_name("pan-end-symbolic");
+        } else {
+            // Expanding → after done the sidebar will be visible, so invite collapse.
+            tab.set_icon_name("pan-start-symbolic");
+        }
+    }
+
     if is_visible {
-        // Collapse: animate position to 0, then hide sidebar.
+        // Collapse: snap away with EaseInBack for a magnetic pull-back feel.
         let target = adw::CallbackAnimationTarget::new({
             let p = paned.clone();
             move |value| {
@@ -3493,8 +3599,8 @@ fn toggle_sidebar(state: &State) {
             .widget(&paned)
             .value_from(current as f64)
             .value_to(0.0)
-            .duration(200)
-            .easing(adw::Easing::EaseInOutCubic)
+            .duration(180)
+            .easing(adw::Easing::EaseInBack)
             .target(&target)
             .build();
         let state_for_done = state.clone();
@@ -3516,7 +3622,7 @@ fn toggle_sidebar(state: &State) {
         state.borrow_mut().sidebar_animation = Some(animation.clone());
         animation.play();
     } else {
-        // Expand: make sidebar visible, then animate position from 0 to remembered width.
+        // Expand: snap open with EaseOutBack for a magnetic overshoot feel.
         sidebar.set_visible(true);
         paned.set_position(0);
         let target = adw::CallbackAnimationTarget::new({
@@ -3529,8 +3635,8 @@ fn toggle_sidebar(state: &State) {
             .widget(&paned)
             .value_from(0.0)
             .value_to(target_width as f64)
-            .duration(200)
-            .easing(adw::Easing::EaseInOutCubic)
+            .duration(220)
+            .easing(adw::Easing::EaseOutBack)
             .target(&target)
             .build();
         let state_for_done = state.clone();
@@ -3550,6 +3656,27 @@ fn toggle_sidebar(state: &State) {
         });
         state.borrow_mut().sidebar_animation = Some(animation.clone());
         animation.play();
+    }
+}
+
+/// Update the sidebar toggle tab's icon to reflect the current sidebar state.
+/// When the sidebar is open (or opening) show a left-pointing chevron so the
+/// user knows a click will collapse it; when closed show a right-pointing
+/// chevron to invite expansion.
+fn update_sidebar_tab_icon(state: &State) {
+    let (tab, is_visible) = {
+        let s = state.borrow();
+        let visible = s
+            .paned
+            .start_child()
+            .map(|sidebar| sidebar.is_visible() && s.paned.position() > 10)
+            .unwrap_or(false);
+        (s.sidebar_tab.clone(), visible)
+    };
+    if is_visible {
+        tab.set_icon_name("pan-start-symbolic");
+    } else {
+        tab.set_icon_name("pan-end-symbolic");
     }
 }
 
